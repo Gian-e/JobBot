@@ -153,7 +153,8 @@ export default function App() {
       const data = await res.json();
       await fetchJobs();
       if (typeof data?.newCount === 'number') {
-        showToast(`Busca concluída: ${data.newCount} nova(s) vaga(s) encontrada(s)!`);
+        const removedMsg = data.removedClosedCount ? ` (${data.removedClosedCount} encerrada(s) removida(s))` : '';
+        showToast(`Busca concluída: ${data.newCount} nova(s) vaga(s) aberta(s)!${removedMsg}`);
       }
     } catch (err) {
       console.error('Failed to run scraper', err);
@@ -202,15 +203,18 @@ export default function App() {
   }, [jobs]);
 
   const filteredJobs = useMemo(() => {
-    if (filter === 'ALL') return jobs;
-    return jobs.filter((job) => {
-      if (filter === 'MID_PLENO') return isMidPleno(job);
-      if (filter === 'PART_TIME') return isPartTimeOrReduced(job);
-      if (filter === 'USD') return FOREIGN_CURRENCIES.has(job.currency);
-      if (filter === 'BRL') return job.currency === 'BRL';
-      if (filter === 'NEW') return job.status === 'New';
-      return true;
-    });
+    const base = filter === 'ALL'
+      ? jobs
+      : jobs.filter((job) => {
+          if (filter === 'MID_PLENO') return isMidPleno(job);
+          if (filter === 'PART_TIME') return isPartTimeOrReduced(job);
+          if (filter === 'USD') return FOREIGN_CURRENCIES.has(job.currency);
+          if (filter === 'BRL') return job.currency === 'BRL';
+          if (filter === 'NEW') return job.status === 'New';
+          return true;
+        });
+
+    return [...base].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (b.id || 0) - (a.id || 0));
   }, [jobs, filter]);
 
   return (
@@ -400,7 +404,7 @@ export default function App() {
                   </div>
                   <div className="flex items-center gap-2">
                     <Calendar className="w-4 h-4 text-slate-400 shrink-0" />
-                    <span className="text-xs text-slate-400">Encontrada em: {job.date}</span>
+                    <span className="text-xs text-slate-400">Aberta em: {job.date}</span>
                   </div>
                 </div>
               </div>

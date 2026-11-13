@@ -60,8 +60,8 @@ O projeto já possui o arquivo `render.yaml` e `Dockerfile` configurados para ro
 > **Dica (Persistência das chaves VAPID no plano Free):**
 > Para evitar que as chaves de Web Push mudem quando o container gratuito reiniciar, rode `npm run generate-vapid` localmente e adicione `VAPID_PUBLIC_KEY` e `VAPID_PRIVATE_KEY` na aba **Environment** do Render.
 
-### Passo 3: Acordar o Servidor Diariamente via GitHub Actions (Grátis)
-No plano gratuito do Render, o servidor hiberna após 15 minutos sem acesso. O workflow `.github/workflows/daily-scrape.yml` já está pronto para acordar o servidor todos os dias às **08:00 (horário de Brasília)**, rodar o scraper e disparar o Push para o seu iPhone:
+### Passo 3: Acordar o Servidor 2x por Dia via GitHub Actions (11h e 23h)
+No plano gratuito do Render, o servidor hiberna após 15 minutos sem acesso. O workflow `.github/workflows/daily-scrape.yml` já está pronto para acordar o servidor todos os dias às **11:00 e às 23:00 (horário de Brasília)**, rodar o scraper e disparar o Push para o seu iPhone informando o número de novas vagas:
 
 1. No seu repositório do GitHub, acesse **Settings** → **Secrets and variables** → **Actions**.
 2. Clique em **New repository secret**:

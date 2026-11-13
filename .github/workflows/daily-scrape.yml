@@ -1,16 +1,16 @@
-name: Daily JobBot Scrape & iPhone Push
+name: Daily JobBot Scrape & iPhone Push (11h & 23h)
 
 on:
   schedule:
-    # Executa todos os dias às 08:00 AM (Horário de Brasília / 11:00 UTC)
-    - cron: '0 11 * * *'
+    # Executa 2x por dia: às 11:00 e às 23:00 (Horário de Brasília / 14:00 e 02:00 UTC)
+    - cron: '0 2,14 * * *'
   workflow_dispatch:
 
 jobs:
   trigger-scrape:
     runs-on: ubuntu-latest
     steps:
-      - name: Wake up server & run daily scraper
+      - name: Wake up server & run scheduled scraper (11h / 23h)
         env:
           APP_URL: ${{ secrets.APP_URL }}
         run: |
@@ -22,6 +22,6 @@ jobs:
           echo "Acordando servidor em $CLEAN_URL/api/health ..."
           curl -sS --retry 5 --retry-delay 10 --max-time 90 "$CLEAN_URL/api/health" || true
           echo ""
-          echo "Disparando busca diária e Web Push em $CLEAN_URL/api/jobs/scrape ..."
+          echo "Disparando busca (11h/23h) e Web Push com contagem de novas vagas em $CLEAN_URL/api/jobs/scrape ..."
           curl -sS -X POST --max-time 120 "$CLEAN_URL/api/jobs/scrape"
           echo ""

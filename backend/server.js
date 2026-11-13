@@ -7,7 +7,13 @@ import * as webpush from 'web-push';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { scrapeJobs } from './scraper.js';
+import {
+    scrapeJobs,
+    checkIfJobUrlIsOpen,
+    getCutoffDateIso,
+    isJobDateOpen,
+    matchesProfileFilter
+} from './scraper.js';
 
 dotenv.config();
 
@@ -90,6 +96,22 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
 });
 
 /**
+ * Retorna o horário atual em Brasília (ex: "11h" ou "23h")
+ */
+function getBrtHourLabel() {
+    try {
+        const hour = new Intl.DateTimeFormat('pt-BR', {
+            timeZone: 'America/Sao_Paulo',
+            hour: '2-digit',
+            hour12: false
+        }).format(new Date());
+        return `${hour}h`;
+    } catch {
+        return `${new Date().getHours()}h`;
+    }
+}
+
+/**
  * Envia notificação Web Push para todos os dispositivos inscritos
  */
 function sendPushNotificationToAll(payload) {
@@ -135,13 +157,80 @@ function sendPushNotificationToAll(payload) {
 }
 
 /**
- * Persiste uma lista de vagas no SQLite em transação única e dispara Push para vagas novas
+ * Verifica todas as vagas salvas no banco e apaga as que têm datas encerradas/antigas
+ * ou cujas páginas já encerraram as inscrições ("Applications closed", 404, deadline vencido, etc.)
  */
-function saveJobsToDatabase(jobs = [], notifyOnNew = true) {
+function purgeClosedAndExpiredJobs() {
     return new Promise((resolve) => {
-        if (!Array.isArray(jobs) || jobs.length === 0) {
-            return resolve({ processed: 0, newCount: 0 });
-        }
+        const cutoffIso = getCutoffDateIso();
+        const todayIso = new Date().toISOString().slice(0, 10);
+
+        // 1. Remove imediatamente vagas com datas vencidas (< cutoff) ou inválidas
+        db.run(
+            `DELETE FROM jobs WHERE date IS NULL OR date < ? OR date > ?`,
+            [cutoffIso, todayIso],
+            function (dateDelErr) {
+                const deletedByDate = !dateDelErr && this?.changes ? this.changes : 0;
+
+                // 2. Verifica cada vaga restante para confirmar se a vaga ainda está aberta na plataforma
+                db.all(`SELECT id, title, company, location, salary_brl, currency, url, date FROM jobs`, [], async (err, rows) => {
+                    if (err || !rows?.length) {
+                        if (deletedByDate > 0) {
+                            console.log(`[JobBot] ${deletedByDate} vaga(s) com data encerrada removida(s).`);
+                        }
+                        return resolve({ removedCount: deletedByDate });
+                    }
+
+                    const idsToDelete = [];
+                    const concurrency = 6;
+
+                    for (let i = 0; i < rows.length; i += concurrency) {
+                        const chunk = rows.slice(i, i + concurrency);
+                        const results = await Promise.all(
+                            chunk.map(async (row) => {
+                                if (!isJobDateOpen(row.date) || !matchesProfileFilter(row)) {
+                                    return row.id;
+                                }
+                                const stillOpen = await checkIfJobUrlIsOpen(row);
+                                return stillOpen ? null : row.id;
+                            })
+                        );
+                        for (const closedId of results) {
+                            if (closedId !== null) idsToDelete.push(closedId);
+                        }
+                    }
+
+                    if (idsToDelete.length === 0) {
+                        if (deletedByDate > 0) {
+                            console.log(`[JobBot] ${deletedByDate} vaga(s) com data encerrada removida(s).`);
+                        }
+                        return resolve({ removedCount: deletedByDate });
+                    }
+
+                    const placeholders = idsToDelete.map(() => '?').join(',');
+                    db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, idsToDelete, function (delErr) {
+                        const deletedByCheck = !delErr && this?.changes ? this.changes : 0;
+                        const totalRemoved = deletedByDate + deletedByCheck;
+                        console.log(`[JobBot] Limpeza concluída: ${totalRemoved} vaga(s) fechada(s)/expirada(s) apagada(s).`);
+                        resolve({ removedCount: totalRemoved });
+                    });
+                });
+            }
+        );
+    });
+}
+
+// Controle para evitar disparos duplicados de Push no mesmo ciclo (ex: cron interno + GitHub Actions juntos)
+let lastScrapePushAt = 0;
+
+/**
+ * Persiste uma lista de vagas abertas no SQLite em transação única e dispara Push com o número de novas vagas
+ */
+function saveJobsToDatabase(jobs = [], { notifyOnNew = true, alwaysNotify = false } = {}) {
+    return new Promise((resolve) => {
+        const openValidJobs = (Array.isArray(jobs) ? jobs : []).filter(
+            (job) => job?.url && isJobDateOpen(job.date)
+        );
 
         db.all(`SELECT url FROM jobs`, [], (err, existingRows) => {
             if (err) {
@@ -163,12 +252,11 @@ function saveJobsToDatabase(jobs = [], notifyOnNew = true) {
 
                 const updateStmt = db.prepare(`
                     UPDATE jobs
-                    SET match_score = ?, salary = ?, salary_brl = ?, work_hours = COALESCE(?, work_hours)
+                    SET match_score = ?, salary = ?, salary_brl = ?, date = ?, work_hours = COALESCE(?, work_hours)
                     WHERE url = ?
                 `);
 
-                for (const job of jobs) {
-                    if (!job?.url) continue;
+                for (const job of openValidJobs) {
                     const workHours = job.work_hours || '8h/dia (Full-time)';
                     const salary = job.salary || 'A combinar';
 
@@ -193,6 +281,7 @@ function saveJobsToDatabase(jobs = [], notifyOnNew = true) {
                             job.match_score,
                             salary,
                             job.salary_brl,
+                            job.date,
                             job.work_hours || null,
                             job.url
                         ]);
@@ -206,41 +295,64 @@ function saveJobsToDatabase(jobs = [], notifyOnNew = true) {
                     if (commitErr) {
                         console.error('Error committing jobs transaction:', commitErr.message);
                     }
-                    if (notifyOnNew && newJobs.length > 0) {
-                        const topJob = newJobs.reduce((best, cur) =>
-                            (cur.match_score || 0) > (best.match_score || 0) ? cur : best
-                        , newJobs[0]);
+
+                    const newCount = newJobs.length;
+                    const nowMs = Date.now();
+                    const recentlyNotified = nowMs - lastScrapePushAt < 5 * 60 * 1000;
+                    const hourLabel = getBrtHourLabel();
+
+                    if (newCount > 0 && (notifyOnNew || alwaysNotify)) {
+                        lastScrapePushAt = nowMs;
+                        const topJob = newJobs.reduce(
+                            (best, cur) => ((cur.match_score || 0) > (best.match_score || 0) ? cur : best),
+                            newJobs[0]
+                        );
 
                         await sendPushNotificationToAll({
-                            title: `🚀 ${newJobs.length} nova(s) vaga(s) Home Office!`,
-                            body: `Destaque (${topJob.match_score}% Match): ${topJob.title} na ${topJob.company} • ${topJob.salary}`,
+                            title: `🚀 JobBot (${hourLabel}): ${newCount} nova(s) vaga(s)!`,
+                            body: `${newCount} nova(s) vaga(s) aberta(s) encontrada(s). Destaque: ${topJob.title} na ${topJob.company} • ${topJob.salary}`,
+                            url: '/'
+                        });
+                    } else if (alwaysNotify && !recentlyNotified) {
+                        lastScrapePushAt = nowMs;
+                        await sendPushNotificationToAll({
+                            title: `🔔 JobBot (${hourLabel}): 0 novas vagas`,
+                            body: `Busca das ${hourLabel} concluída: 0 novas vagas abertas no momento (${existingUrls.size} vagas ativas no painel).`,
                             url: '/'
                         });
                     }
-                    resolve({ processed: jobs.length, newCount: newJobs.length });
+
+                    resolve({ processed: openValidJobs.length, newCount });
                 });
             });
         });
     });
 }
 
-// Lock para evitar execuções concorrentes do scraper
+// Lock para evitar execuções concorrentes do worker
 let activeScrapePromise = null;
 
-async function runScraper() {
+async function runScraper({ alwaysNotify = false } = {}) {
     if (activeScrapePromise) {
         return activeScrapePromise;
     }
 
     activeScrapePromise = (async () => {
-        console.log('[JobBot] Running job search...');
+        console.log('[JobBot] Verificando vagas encerradas e buscando novas vagas abertas...');
         try {
+            // 1. Apaga vagas com datas encerradas ou inscrições fechadas já salvas no banco
+            const cleanup = await purgeClosedAndExpiredJobs();
+            // 2. Coleta e valida novas vagas abertas
             const jobs = await scrapeJobs();
-            const stats = await saveJobsToDatabase(jobs, true);
-            return { jobs, newCount: stats.newCount };
+            const stats = await saveJobsToDatabase(jobs, { notifyOnNew: true, alwaysNotify });
+            return {
+                jobs,
+                newCount: stats.newCount,
+                removedClosedCount: cleanup.removedCount
+            };
         } catch (err) {
             console.error('[JobBot] Error running scraper:', err.message);
-            return { jobs: [], newCount: 0 };
+            return { jobs: [], newCount: 0, removedClosedCount: 0 };
         } finally {
             activeScrapePromise = null;
         }
@@ -279,7 +391,7 @@ app.post('/api/push/subscribe', (req, res) => {
 
             await sendPushNotificationToAll({
                 title: 'JobBot conectado no iPhone! 📲',
-                body: 'Você receberá alertas sempre que surgirem novas vagas Home Office > 12k BRL ou USD/EUR.',
+                body: 'Você receberá alertas às 11h e às 23h com o número de novas vagas abertas!',
                 url: '/'
             });
             res.json({ message: 'Push subscription registered successfully!' });
@@ -300,18 +412,23 @@ app.post('/api/push/unsubscribe', (req, res) => {
 app.post('/api/push/test', async (req, res) => {
     const result = await sendPushNotificationToAll({
         title: '🔔 Notificação de Teste • JobBot',
-        body: 'Seu WebApp no iPhone está configurado e pronto para avisar sobre novas vagas diárias!',
+        body: 'Seu WebApp no iPhone está configurado para avisar às 11h e 23h sobre novas vagas!',
         url: '/'
     });
     res.json({ message: 'Test notification dispatched.', ...result });
 });
 
-// Jobs Routes
+// Jobs Routes (ordenadas por data de abertura: mais recentes primeiro)
 app.get('/api/jobs', (req, res) => {
-    db.all(`SELECT * FROM jobs ORDER BY date DESC, match_score DESC`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ jobs: rows });
-    });
+    const cutoffIso = getCutoffDateIso();
+    db.all(
+        `SELECT * FROM jobs WHERE date >= ? ORDER BY date DESC, id DESC`,
+        [cutoffIso],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ jobs: rows });
+        }
+    );
 });
 
 app.post('/api/jobs/ingest', async (req, res) => {
@@ -320,17 +437,18 @@ app.post('/api/jobs/ingest', async (req, res) => {
         return res.status(400).json({ error: 'Payload deve ser um array de vagas.' });
     }
 
-    const stats = await saveJobsToDatabase(jobs, true);
+    const stats = await saveJobsToDatabase(jobs, { notifyOnNew: true, alwaysNotify: false });
     res.json({ message: `${jobs.length} vagas processadas!`, ...stats });
 });
 
 app.post('/api/jobs/scrape', async (req, res) => {
     try {
-        const result = await runScraper();
+        const result = await runScraper({ alwaysNotify: true });
         res.json({
             message: 'Scraping executed successfully!',
             processed: result.jobs.length,
-            newCount: result.newCount
+            newCount: result.newCount,
+            removedClosedCount: result.removedClosedCount
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -360,12 +478,25 @@ if (fs.existsSync(frontendDist)) {
     });
 }
 
-// Schedule cron job to run every day at 08:00 AM (America/Sao_Paulo)
-cron.schedule('0 8 * * *', () => runScraper(), { timezone: 'America/Sao_Paulo' });
+// Agendamento 2x por dia: às 11:00 e às 23:00 (Horário de Brasília - America/Sao_Paulo)
+cron.schedule(
+    '0 11,23 * * *',
+    () => {
+        runScraper({ alwaysNotify: true });
+    },
+    { timezone: 'America/Sao_Paulo' }
+);
 
 const server = app.listen(PORT, () => {
     console.log(`JobBot Backend & PWA server running on http://localhost:${PORT}`);
-    runScraper();
+    // Ao iniciar, se o banco estiver vazio, executa a primeira varredura
+    db.get(`SELECT COUNT(*) as count FROM jobs`, [], (err, row) => {
+        if (!err && (!row || row.count === 0)) {
+            runScraper({ alwaysNotify: false });
+        } else {
+            purgeClosedAndExpiredJobs();
+        }
+    });
 });
 
 function shutdown() {

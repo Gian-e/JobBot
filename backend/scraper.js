@@ -1,6 +1,7 @@
 /**
  * JobBot Scraper Engine (Node.js)
  * Coleta vagas reais nas plataformas LinkedIn, Gupy, RemoteOK, WeWorkRemotely e Remotive,
+ * valida se as vagas continuam abertas (data recente, deadline ativo e página sem aviso de encerramento),
  * filtra pelo perfil do Gian (Mid/Pleno e Senior, Remote, >= R$ 12k ou USD/EUR/GBP),
  * calcula o match_score (0 a 100) e deduplica por URL seguindo o contrato do SQLite.
  */
@@ -14,6 +15,9 @@ const EXCHANGE_RATES = {
 
 const VALID_CURRENCIES = ['USD', 'EUR', 'BRL', 'GBP'];
 const FOREIGN_CURRENCIES = new Set(['USD', 'EUR', 'GBP']);
+
+// Idade máxima permitida para uma vaga ser considerada ativa/recente (em dias)
+export const MAX_JOB_AGE_DAYS = 21;
 
 const PROFILE_CONFIG = {
     minSalaryBrl: 12000,
@@ -65,8 +69,74 @@ const INTERN_REGEX = /\b(intern|internship|est[aá]gio|estagi[aá]rio|trainee)\b
 const JUNIOR_OR_INTERN_REGEX = /\b(est[aá]gio|estagi[aá]rio|trainee|j[uú]nior|jr)\b/i;
 const SENIOR_REGEX = /\b(s[eê]nior|sr|lead|especialista|staff)\b/i;
 
+// Padrões textuais e de HTML que indicam que a vaga foi encerrada/fechada
+const CLOSED_JOB_PAGE_REGEX = new RegExp(
+    [
+        'applications\\s+closed',
+        'no\\s+longer\\s+accepting\\s+applications',
+        'inscri[cç][oõ]es\\s+encerradas',
+        'n[aã]o\\s+aceita\\s+mais\\s+candidaturas',
+        'candidaturas\\s+encerradas',
+        'vaga\\s+encerrada',
+        'vaga\\s+fechada',
+        'esta\\s+vaga\\s+n[aã]o\\s+est[aá]\\s+mais\\s+dispon[ií]vel',
+        'this\\s+job\\s+is\\s+no\\s+longer\\s+available',
+        'this\\s+position\\s+has\\s+been\\s+filled',
+        'position\\s+has\\s+been\\s+filled',
+        'job\\s+has\\s+expired',
+        'closed-job__icon',
+        '"isPublished"\\s*:\\s*false',
+        '"status"\\s*:\\s*"(?:closed|expired|inactive|canceled)"'
+    ].join('|'),
+    'i'
+);
+
 function getTodayIso() {
     return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Calcula a data limite mínima (YYYY-MM-DD) para vagas abertas/recentes
+ */
+export function getCutoffDateIso(maxAgeDays = MAX_JOB_AGE_DAYS) {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - maxAgeDays);
+    return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Verifica se uma data (YYYY-MM-DD ou string parseável) está dentro da janela de vagas ativas
+ */
+export function isJobDateOpen(dateInput, maxAgeDays = MAX_JOB_AGE_DAYS) {
+    if (!dateInput) return false;
+    const raw = String(dateInput).trim();
+    const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    let dateIso = isoMatch ? isoMatch[1] : '';
+
+    if (!dateIso) {
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) return false;
+        dateIso = parsed.toISOString().slice(0, 10);
+    }
+
+    const cutoffIso = getCutoffDateIso(maxAgeDays);
+    const todayIso = getTodayIso();
+    return dateIso >= cutoffIso && dateIso <= todayIso;
+}
+
+/**
+ * Verifica se um deadline (applicationDeadline / validThrough) ainda não venceu
+ */
+export function isDeadlineStillOpen(deadlineInput) {
+    if (!deadlineInput) return true;
+    const raw = String(deadlineInput).trim();
+    const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (isoMatch) {
+        return isoMatch[1] >= getTodayIso();
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return true;
+    return parsed.getTime() >= Date.now() - 86400000;
 }
 
 /**
@@ -232,16 +302,25 @@ export function calculateMatchScore(job) {
 }
 
 /**
- * Valida se a vaga atende aos requisitos do perfil do Gian:
- * 1. Modalidade estritamente Remote / Home Office
- * 2. Remuneração mínima: salary_brl >= 12000 ou moeda estrangeira (USD, EUR, GBP)
- * 3. Tech Stack compatível
+ * Valida se a vaga atende aos requisitos do perfil do Gian e não contém aviso de vaga fechada
  */
 export function matchesProfileFilter(job) {
     const titleLower = String(job.title || '').toLowerCase();
     if (INTERN_REGEX.test(titleLower)) return false;
 
     const descLower = String(job.description || '').toLowerCase();
+    if (CLOSED_JOB_PAGE_REGEX.test(titleLower) || CLOSED_JOB_PAGE_REGEX.test(descLower)) {
+        return false;
+    }
+
+    if (job.date && !isJobDateOpen(job.date)) {
+        return false;
+    }
+
+    if (job.applicationDeadline && !isDeadlineStillOpen(job.applicationDeadline)) {
+        return false;
+    }
+
     const locationLower = String(job.location || '').toLowerCase();
     const locationAndTitle = `${locationLower} ${titleLower} ${descLower}`;
 
@@ -309,7 +388,7 @@ export function normalizeJobContract(rawJob) {
 /**
  * Helper de fetch com timeout
  */
-async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -320,10 +399,106 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
 }
 
 /**
- * 1. LinkedIn Jobs (Guest Search API pública com f_WT=2 Remote - paralelo)
+ * Verifica ativamente se a URL da vaga continua aberta e com data/deadline válidos
+ */
+export async function checkIfJobUrlIsOpen(job) {
+    if (!job?.url) return false;
+    if (job.date && !isJobDateOpen(job.date)) return false;
+    if (job.applicationDeadline && !isDeadlineStillOpen(job.applicationDeadline)) return false;
+
+    try {
+        const resp = await fetchWithTimeout(
+            job.url,
+            {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+                },
+                redirect: 'follow'
+            },
+            6500
+        );
+
+        if (resp.status === 404 || resp.status === 410) {
+            return false;
+        }
+
+        // Se houve redirecionamento para home/lista genérica sem a vaga (ex: Gupy/WWR/Remotive expirada)
+        const finalUrl = String(resp.url || '').toLowerCase();
+        if (
+            finalUrl &&
+            (/\/jobs\/?$|\/remote-jobs\/?$|expired|closed|not-found|404/.test(finalUrl)) &&
+            !finalUrl.includes(normalizeUrl(job.url).toLowerCase().split('/').pop())
+        ) {
+            return false;
+        }
+
+        if (!resp.ok) {
+            // Se bloqueou por rate-limit (429/999 no LinkedIn), mantém se a data for recente
+            return isJobDateOpen(job.date);
+        }
+
+        const html = await resp.text();
+        if (!html) return false;
+
+        // 1. Checa avisos explícitos de vaga encerrada ("Applications closed", "No longer accepting applications", "Inscrições encerradas", etc.)
+        if (CLOSED_JOB_PAGE_REGEX.test(html)) {
+            return false;
+        }
+
+        // 2. Checa deadline expirado no JSON-LD ou __NEXT_DATA__ (applicationDeadline / validThrough)
+        const deadlineMatch = html.match(/"(?:applicationDeadline|validThrough)"\s*:\s*"(\d{4}-\d{2}-\d{2}[^"]*)"/i);
+        if (deadlineMatch && !isDeadlineStillOpen(deadlineMatch[1])) {
+            return false;
+        }
+
+        // 3. Checa data de publicação real embutida na página (datePosted / publishedDate)
+        const postedMatch = html.match(/"(?:datePosted|publishedDate)"\s*:\s*"(\d{4}-\d{2}-\d{2})/i);
+        if (postedMatch && !isJobDateOpen(postedMatch[1])) {
+            return false;
+        }
+
+        // 4. Checa texto explícito "Published on MONTH DD, YYYY" (ex: Gupy em inglês "Published on OCTOBER 28, 2025")
+        const publishedOnTextMatch = html.match(/Published\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i);
+        if (publishedOnTextMatch && !isJobDateOpen(publishedOnTextMatch[1])) {
+            return false;
+        }
+
+        return true;
+    } catch {
+        // Em caso de timeout de rede pontual, confia na validação rigorosa de data recente
+        return isJobDateOpen(job.date);
+    }
+}
+
+/**
+ * Filtra uma lista de vagas verificando em lotes paralelos se continuam abertas
+ */
+export async function filterOpenJobs(jobs = [], concurrency = 6) {
+    const preFiltered = jobs.filter(
+        (j) => j && j.url && (!j.date || isJobDateOpen(j.date)) && (!j.applicationDeadline || isDeadlineStillOpen(j.applicationDeadline))
+    );
+
+    const openJobs = [];
+    for (let i = 0; i < preFiltered.length; i += concurrency) {
+        const chunk = preFiltered.slice(i, i + concurrency);
+        const checks = await Promise.all(
+            chunk.map(async (job) => {
+                const isOpen = await checkIfJobUrlIsOpen(job);
+                return isOpen ? job : null;
+            })
+        );
+        for (const item of checks) {
+            if (item) openJobs.push(item);
+        }
+    }
+    return openJobs;
+}
+
+/**
+ * 1. LinkedIn Jobs (Guest Search API pública com f_WT=2 Remote e f_TPR=r604800 últimos 7 dias)
  */
 async function fetchLinkedInJobs() {
-    const today = getTodayIso();
     const queries = [
         { keywords: 'Full Stack React Node', location: 'Worldwide', currency: 'USD', fallback: 4500 },
         { keywords: 'Python React Developer', location: 'Latin America', currency: 'USD', fallback: 4200 },
@@ -334,7 +509,8 @@ async function fetchLinkedInJobs() {
     const batches = await Promise.all(
         queries.map(async (q) => {
             try {
-                const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(q.keywords)}&location=${encodeURIComponent(q.location)}&f_WT=2&start=0`;
+                // f_WT=2 (Remoto) + f_TPR=r604800 (Publicadas nos últimos 7 dias)
+                const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(q.keywords)}&location=${encodeURIComponent(q.location)}&f_WT=2&f_TPR=r604800&start=0`;
                 const resp = await fetchWithTimeout(url, {
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -346,15 +522,18 @@ async function fetchLinkedInJobs() {
                 const cards = htmlText.match(/<li[\s\S]*?<\/li>/gi) || [];
                 const parsed = [];
 
-                for (const card of cards.slice(0, 12)) {
+                for (const card of cards.slice(0, 10)) {
                     const titleMatch = card.match(/base-search-card__title[^>]*>([\s\S]*?)<\/h3>/i);
                     const linkMatch = card.match(/href="(https:\/\/[^"]*linkedin\.com\/jobs\/view\/[^"?]+)/i);
-                    if (!titleMatch || !linkMatch) continue;
+                    const dateMatch = card.match(/datetime="(\d{4}-\d{2}-\d{2})"/i);
+                    if (!titleMatch || !linkMatch || !dateMatch) continue;
+
+                    const jobDate = dateMatch[1];
+                    if (!isJobDateOpen(jobDate)) continue;
 
                     const compMatch = card.match(/base-search-card__subtitle[^>]*>([\s\S]*?)<\/h4>/i);
                     const locMatch = card.match(/job-search-card__location[^>]*>([\s\S]*?)<\/span>/i);
                     const salMatch = card.match(/job-search-card__salary-info[^>]*>([\s\S]*?)<\/span>/i);
-                    const dateMatch = card.match(/<time[^>]*datetime="(\d{4}-\d{2}-\d{2})"/i);
 
                     const title = stripHtml(titleMatch[1]);
                     const company = compMatch ? stripHtml(compMatch[1]) : 'LinkedIn Recruiting';
@@ -371,7 +550,7 @@ async function fetchLinkedInJobs() {
                         salary_brl: salaryInfo.salary_brl,
                         platform: 'LinkedIn',
                         url: normalizeUrl(linkMatch[1]),
-                        date: dateMatch ? dateMatch[1] : today,
+                        date: jobDate,
                         tags: q.keywords.split(' '),
                         description: `${title} - ${company} (${location}) - ${q.keywords}`
                     });
@@ -388,10 +567,9 @@ async function fetchLinkedInJobs() {
 }
 
 /**
- * 2. Gupy Portal API (Vagas remotas no Brasil - paralelo)
+ * 2. Gupy Portal API (Vagas remotas no Brasil - valida isPublished, publishedDate e applicationDeadline)
  */
 async function fetchGupyJobs() {
-    const today = getTodayIso();
     const terms = ['Node.js', 'React', 'Python', 'Fullstack'];
 
     const batches = await Promise.all(
@@ -399,15 +577,27 @@ async function fetchGupyJobs() {
             try {
                 const url = `https://portal.api.gupy.io/api/v1/jobs?jobName=${encodeURIComponent(term)}&workplaceType=remote&limit=10`;
                 const response = await fetchWithTimeout(url, {
-                    headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'application/json'
+                    }
                 });
                 if (!response.ok) return [];
+
+                const contentType = response.headers.get('content-type') || '';
+                if (!contentType.includes('application/json')) return [];
 
                 const json = await response.json();
                 const items = Array.isArray(json.data) ? json.data : [];
                 const parsed = [];
 
                 for (const item of items) {
+                    if (item.isPublished === false) continue;
+
+                    const publishedDate = item.publishedDate ? String(item.publishedDate).slice(0, 10) : '';
+                    if (!isJobDateOpen(publishedDate)) continue;
+                    if (!isDeadlineStillOpen(item.applicationDeadline)) continue;
+
                     const title = String(item.name || '').trim();
                     const jobUrl = normalizeUrl(item.jobUrl || '');
                     if (!title || !jobUrl || JUNIOR_OR_INTERN_REGEX.test(title)) continue;
@@ -423,7 +613,8 @@ async function fetchGupyJobs() {
                         salary_brl: estimatedBrl,
                         platform: 'Gupy',
                         url: jobUrl,
-                        date: item.publishedDate ? String(item.publishedDate).slice(0, 10) : today,
+                        date: publishedDate,
+                        applicationDeadline: item.applicationDeadline || null,
                         tags: [term, 'Remote', 'Brasil'],
                         description: stripHtml(item.description || '')
                     });
@@ -439,10 +630,9 @@ async function fetchGupyJobs() {
 }
 
 /**
- * 3. RemoteOK API (Vagas internacionais em USD)
+ * 3. RemoteOK API (Vagas internacionais em USD com validação de data)
  */
 async function fetchRemoteOkJobs() {
-    const today = getTodayIso();
     try {
         const response = await fetchWithTimeout('https://remoteok.com/api', {
             headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
@@ -454,7 +644,11 @@ async function fetchRemoteOkJobs() {
 
         return data
             .slice(1, 35)
-            .filter((item) => item && item.position && (item.url || item.apply_url))
+            .filter((item) => {
+                if (!item || !item.position || (!item.url && !item.apply_url)) return false;
+                const itemDate = item.date ? String(item.date).slice(0, 10) : '';
+                return isJobDateOpen(itemDate);
+            })
             .map((item) => {
                 const salaryMin = Number(item.salary_min) || 0;
                 const salaryMax = Number(item.salary_max) || 0;
@@ -479,7 +673,7 @@ async function fetchRemoteOkJobs() {
                     salary_brl: convertToBrl(monthlyUsd, 'USD'),
                     platform: 'RemoteOK',
                     url: normalizeUrl(fullUrl),
-                    date: item.date ? String(item.date).slice(0, 10) : today,
+                    date: String(item.date).slice(0, 10),
                     tags: Array.isArray(item.tags) ? item.tags : [],
                     description: stripHtml(item.description || '').slice(0, 500)
                 };
@@ -491,7 +685,7 @@ async function fetchRemoteOkJobs() {
 }
 
 /**
- * 4. WeWorkRemotely RSS (Full-Stack & Backend Programming - paralelo)
+ * 4. WeWorkRemotely RSS (Full-Stack & Backend Programming com parsing de <pubDate>)
  */
 async function fetchWeWorkRemotelyJobs() {
     const today = getTodayIso();
@@ -517,6 +711,14 @@ async function fetchWeWorkRemotelyJobs() {
                     const link = stripHtml((itemXml.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || '');
                     if (!rawTitle || !link) continue;
 
+                    const pubDateRaw = stripHtml((itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [])[1] || '');
+                    const parsedPubDate = pubDateRaw ? new Date(pubDateRaw) : null;
+                    const jobDate = parsedPubDate && !Number.isNaN(parsedPubDate.getTime())
+                        ? parsedPubDate.toISOString().slice(0, 10)
+                        : today;
+
+                    if (!isJobDateOpen(jobDate)) continue;
+
                     const region = stripHtml((itemXml.match(/<region>([\s\S]*?)<\/region>/i) || [])[1] || 'Worldwide');
                     const description = stripHtml((itemXml.match(/<description>([\s\S]*?)<\/description>/i) || [])[1] || '');
 
@@ -536,7 +738,7 @@ async function fetchWeWorkRemotelyJobs() {
                         salary_brl: convertToBrl(monthlyUsd, 'USD'),
                         platform: 'WeWorkRemotely',
                         url: normalizeUrl(link),
-                        date: today,
+                        date: jobDate,
                         work_hours: workHours,
                         tags: [],
                         description: description.slice(0, 600)
@@ -554,10 +756,9 @@ async function fetchWeWorkRemotelyJobs() {
 }
 
 /**
- * 5. Remotive API (Software Development Remote Jobs)
+ * 5. Remotive API (Software Development Remote Jobs com validação de data)
  */
 async function fetchRemotiveJobs() {
-    const today = getTodayIso();
     try {
         const response = await fetchWithTimeout('https://remotive.com/api/remote-jobs?category=software-dev&limit=25', {
             headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
@@ -567,26 +768,31 @@ async function fetchRemotiveJobs() {
         const data = await response.json();
         const jobs = Array.isArray(data.jobs) ? data.jobs : [];
 
-        return jobs.map((item) => {
-            const salaryInfo = parseSalaryInfo(item.salary || '', 'USD', 4200);
-            const loc = item.candidate_required_location || 'Worldwide';
-            const isPartTime = /part/i.test(item.job_type || '');
+        return jobs
+            .filter((item) => {
+                const pubDate = item?.publication_date ? String(item.publication_date).slice(0, 10) : '';
+                return isJobDateOpen(pubDate);
+            })
+            .map((item) => {
+                const salaryInfo = parseSalaryInfo(item.salary || '', 'USD', 4200);
+                const loc = item.candidate_required_location || 'Worldwide';
+                const isPartTime = /part/i.test(item.job_type || '');
 
-            return {
-                title: item.title || '',
-                company: item.company_name || 'Remotive Partner',
-                location: /remote/i.test(loc) ? loc : `Remote (${loc})`,
-                salary: salaryInfo.salary,
-                currency: salaryInfo.currency,
-                salary_brl: salaryInfo.salary_brl,
-                platform: 'Remotive',
-                url: normalizeUrl(item.url || ''),
-                date: item.publication_date ? String(item.publication_date).slice(0, 10) : today,
-                work_hours: isPartTime ? '4h/dia (Meio Período)' : undefined,
-                tags: Array.isArray(item.tags) ? item.tags : [],
-                description: stripHtml(item.description || '').slice(0, 500)
-            };
-        });
+                return {
+                    title: item.title || '',
+                    company: item.company_name || 'Remotive Partner',
+                    location: /remote/i.test(loc) ? loc : `Remote (${loc})`,
+                    salary: salaryInfo.salary,
+                    currency: salaryInfo.currency,
+                    salary_brl: salaryInfo.salary_brl,
+                    platform: 'Remotive',
+                    url: normalizeUrl(item.url || ''),
+                    date: String(item.publication_date).slice(0, 10),
+                    work_hours: isPartTime ? '4h/dia (Meio Período)' : undefined,
+                    tags: Array.isArray(item.tags) ? item.tags : [],
+                    description: stripHtml(item.description || '').slice(0, 500)
+                };
+            });
     } catch (err) {
         console.warn('[Scraper] Aviso Remotive:', err.message);
         return [];
@@ -595,7 +801,7 @@ async function fetchRemotiveJobs() {
 
 /**
  * Executa a varredura real em todas as fontes em paralelo, filtra pelo perfil do Gian,
- * calcula o match_score (0 a 100) e deduplica por URL.
+ * verifica ativamente se cada vaga segue aberta e deduplica por URL.
  */
 export async function scrapeJobs() {
     console.log('[Scraper] Iniciando varredura real (LinkedIn, Gupy, RemoteOK, WeWorkRemotely, Remotive)...');
@@ -610,7 +816,7 @@ export async function scrapeJobs() {
 
     const rawCandidates = batches.flat();
     const seenUrls = new Set();
-    const validJobs = [];
+    const profileMatched = [];
 
     for (const candidate of rawCandidates) {
         if (!candidate?.url || !candidate?.title) continue;
@@ -619,12 +825,16 @@ export async function scrapeJobs() {
         if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
         if (!matchesProfileFilter(candidate)) continue;
 
-        const contractJob = normalizeJobContract({ ...candidate, url: normalizedUrl });
         seenUrls.add(normalizedUrl);
-        validJobs.push(contractJob);
+        profileMatched.push({ ...candidate, url: normalizedUrl });
     }
 
-    validJobs.sort((a, b) => b.match_score - a.match_score || b.salary_brl - a.salary_brl);
-    console.log(`[Scraper] ${validJobs.length} vagas reais únicas filtradas.`);
+    // Verifica ativamente se as vagas filtradas estão abertas e com prazo válido
+    const verifiedOpenCandidates = await filterOpenJobs(profileMatched, 6);
+    const validJobs = verifiedOpenCandidates.map((c) => normalizeJobContract(c));
+
+    // Ordena por data de abertura (mais recentes primeiro), desempatando por match_score e salário
+    validJobs.sort((a, b) => b.date.localeCompare(a.date) || b.match_score - a.match_score || b.salary_brl - a.salary_brl);
+    console.log(`[Scraper] ${validJobs.length} vagas abertas confirmadas (de ${profileMatched.length} candidatas).`);
     return validJobs;
 }
