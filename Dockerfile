@@ -2,23 +2,18 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Instala Python3 + requests para suportar tanto o scraper JS quanto o Python
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-requests \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY package.json ./
 COPY frontend/package*.json ./frontend/
 COPY backend/package*.json ./backend/
 
-RUN npm install --prefix frontend && npm install --prefix backend
+RUN npm install --prefix frontend && npm install --omit=dev --prefix backend
 
-COPY . .
+COPY frontend ./frontend
+RUN npm run build --prefix frontend && rm -rf frontend/node_modules
 
-RUN npm run build --prefix frontend
+COPY backend ./backend
 
+ENV NODE_ENV=production
 EXPOSE 3000
 
 CMD ["node", "backend/server.js"]

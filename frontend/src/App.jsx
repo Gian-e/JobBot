@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Briefcase,
   Building,
@@ -15,6 +15,21 @@ import {
 } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
+const FOREIGN_CURRENCIES = new Set(['USD', 'EUR', 'GBP']);
+const MID_PLENO_REGEX = /pleno|mid[\s-]?level|\bmid\b|intermediate/i;
+const PART_TIME_REGEX = /meio per[ií]odo|part[\s-]?time|4h|6h/i;
+
+const FILTER_TABS = [
+  { id: 'ALL', label: 'Todas as Vagas' },
+  { id: 'MID_PLENO', label: 'Mid / Pleno' },
+  { id: 'PART_TIME', label: 'Meio Período / 6h' },
+  { id: 'USD', label: 'Estrangeiras (USD/EUR)' },
+  { id: 'BRL', label: 'Nacionais (> 12k)' },
+  { id: 'NEW', label: 'Novas' }
+];
+
+const isMidPleno = (job) => MID_PLENO_REGEX.test(job.title || '');
+const isPartTimeOrReduced = (job) => PART_TIME_REGEX.test(job.work_hours || '');
 
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -36,8 +51,15 @@ export default function App() {
   const [pushLoading, setPushLoading] = useState(false);
   const [iosNeedsInstall, setIosNeedsInstall] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
+  const toastTimerRef = useRef(null);
 
-  const fetchJobs = async () => {
+  const showToast = useCallback((msg) => {
+    setStatusMessage(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setStatusMessage(''), 4500);
+  }, []);
+
+  const fetchJobs = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/jobs`);
       const data = await res.json();
@@ -45,12 +67,11 @@ export default function App() {
     } catch (err) {
       console.error('Failed to fetch jobs', err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchJobs();
 
-    // Detect iOS Safari not yet added to Home Screen
     const isIos = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
     const isStandalone =
       window.matchMedia('(display-mode: standalone)').matches ||
@@ -60,23 +81,19 @@ export default function App() {
       setIosNeedsInstall(true);
     }
 
-    // Check Service Worker & PushManager support
     if ('serviceWorker' in navigator && 'PushManager' in window) {
       setPushSupported(true);
       navigator.serviceWorker
         .register('/sw.js')
         .then((reg) => reg.pushManager.getSubscription())
-        .then((sub) => {
-          setPushSubscribed(Boolean(sub));
-        })
+        .then((sub) => setPushSubscribed(Boolean(sub)))
         .catch((err) => console.error('SW registration error:', err));
     }
-  }, []);
 
-  const showToast = (msg) => {
-    setStatusMessage(msg);
-    setTimeout(() => setStatusMessage(''), 4500);
-  };
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, [fetchJobs]);
 
   const enablePushNotifications = async () => {
     if (!pushSupported) {
@@ -135,7 +152,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/jobs/scrape`, { method: 'POST' });
       const data = await res.json();
       await fetchJobs();
-      if (data && typeof data.newCount === 'number') {
+      if (typeof data?.newCount === 'number') {
         showToast(`Busca concluída: ${data.newCount} nova(s) vaga(s) encontrada(s)!`);
       }
     } catch (err) {
@@ -146,30 +163,55 @@ export default function App() {
   };
 
   const updateStatus = async (id, status) => {
+    setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, status } : j)));
     try {
-      await fetch(`${API_BASE}/api/jobs/${id}`, {
+      const res = await fetch(`${API_BASE}/api/jobs/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status })
       });
-      fetchJobs();
+      if (!res.ok) throw new Error('Status update failed');
     } catch (err) {
       console.error('Failed to update status', err);
+      fetchJobs();
     }
   };
 
-  const isMidPleno = (job) => /pleno|mid[\s-]?level|\bmid\b|intermediate/i.test(job.title || '');
-  const isPartTimeOrReduced = (job) => /meio per[ií]odo|part[\s-]?time|4h|6h/i.test(job.work_hours || '');
+  const stats = useMemo(() => {
+    const total = jobs.length;
+    if (total === 0) {
+      return { total: 0, foreignCount: 0, avgSalaryBrl: 0, avgMatchScore: 0 };
+    }
 
-  const filteredJobs = jobs.filter((job) => {
-    if (filter === 'ALL') return true;
-    if (filter === 'MID_PLENO') return isMidPleno(job);
-    if (filter === 'PART_TIME') return isPartTimeOrReduced(job);
-    if (filter === 'USD') return job.currency === 'USD' || job.currency === 'EUR' || job.currency === 'GBP';
-    if (filter === 'BRL') return job.currency === 'BRL';
-    if (filter === 'NEW') return job.status === 'New';
-    return true;
-  });
+    let foreignCount = 0;
+    let sumSalary = 0;
+    let sumScore = 0;
+
+    for (const j of jobs) {
+      if (FOREIGN_CURRENCIES.has(j.currency)) foreignCount += 1;
+      sumSalary += j.salary_brl || 0;
+      sumScore += j.match_score || 0;
+    }
+
+    return {
+      total,
+      foreignCount,
+      avgSalaryBrl: Math.round(sumSalary / total),
+      avgMatchScore: Math.round(sumScore / total)
+    };
+  }, [jobs]);
+
+  const filteredJobs = useMemo(() => {
+    if (filter === 'ALL') return jobs;
+    return jobs.filter((job) => {
+      if (filter === 'MID_PLENO') return isMidPleno(job);
+      if (filter === 'PART_TIME') return isPartTimeOrReduced(job);
+      if (filter === 'USD') return FOREIGN_CURRENCIES.has(job.currency);
+      if (filter === 'BRL') return job.currency === 'BRL';
+      if (filter === 'NEW') return job.status === 'New';
+      return true;
+    });
+  }, [jobs, filter]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -255,7 +297,7 @@ export default function App() {
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
               <p className="text-xs text-slate-400 font-medium">Total de Vagas</p>
-              <h3 className="text-2xl font-bold text-white mt-1">{jobs.length}</h3>
+              <h3 className="text-2xl font-bold text-white mt-1">{stats.total}</h3>
             </div>
             <div className="p-3 bg-blue-500/10 text-blue-400 rounded-lg">
               <Briefcase className="w-5 h-5" />
@@ -264,9 +306,7 @@ export default function App() {
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
               <p className="text-xs text-slate-400 font-medium">Moeda Estrangeira (USD)</p>
-              <h3 className="text-2xl font-bold text-emerald-400 mt-1">
-                {jobs.filter((j) => j.currency === 'USD' || j.currency === 'EUR' || j.currency === 'GBP').length}
-              </h3>
+              <h3 className="text-2xl font-bold text-emerald-400 mt-1">{stats.foreignCount}</h3>
             </div>
             <div className="p-3 bg-emerald-500/10 text-emerald-400 rounded-lg">
               <Globe className="w-5 h-5" />
@@ -276,7 +316,7 @@ export default function App() {
             <div>
               <p className="text-xs text-slate-400 font-medium">Média Salarial (BRL)</p>
               <h3 className="text-2xl font-bold text-indigo-400 mt-1">
-                R$ {jobs.length ? Math.round(jobs.reduce((acc, j) => acc + j.salary_brl, 0) / jobs.length).toLocaleString() : 0}
+                R$ {stats.avgSalaryBrl.toLocaleString('pt-BR')}
               </h3>
             </div>
             <div className="p-3 bg-indigo-500/10 text-indigo-400 rounded-lg">
@@ -286,9 +326,7 @@ export default function App() {
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
               <p className="text-xs text-slate-400 font-medium">Match Médio CV</p>
-              <h3 className="text-2xl font-bold text-amber-400 mt-1">
-                {jobs.length ? Math.round(jobs.reduce((acc, j) => acc + j.match_score, 0) / jobs.length) : 0}%
-              </h3>
+              <h3 className="text-2xl font-bold text-amber-400 mt-1">{stats.avgMatchScore}%</h3>
             </div>
             <div className="p-3 bg-amber-500/10 text-amber-400 rounded-lg">
               <Star className="w-5 h-5" />
@@ -298,22 +336,17 @@ export default function App() {
 
         {/* Filter Tabs */}
         <div className="flex gap-2 mb-6 border-b border-slate-800 pb-4 overflow-x-auto">
-          {['ALL', 'MID_PLENO', 'PART_TIME', 'USD', 'BRL', 'NEW'].map((tab) => (
+          {FILTER_TABS.map((tab) => (
             <button
-              key={tab}
-              onClick={() => setFilter(tab)}
+              key={tab.id}
+              onClick={() => setFilter(tab.id)}
               className={`px-4 py-2 rounded-lg text-sm font-medium transition cursor-pointer whitespace-nowrap ${
-                filter === tab
+                filter === tab.id
                   ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/30'
                   : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
               }`}
             >
-              {tab === 'ALL' && 'Todas as Vagas'}
-              {tab === 'MID_PLENO' && 'Mid / Pleno'}
-              {tab === 'PART_TIME' && 'Meio Período / 6h'}
-              {tab === 'USD' && 'Estrangeiras (USD/EUR)'}
-              {tab === 'BRL' && 'Nacionais (> 12k)'}
-              {tab === 'NEW' && 'Novas'}
+              {tab.label}
             </button>
           ))}
         </div>

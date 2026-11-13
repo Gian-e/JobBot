@@ -4,50 +4,73 @@ Sistema inteligente de busca diária de vagas **Home Office** (com preferência 
 
 ---
 
-## 🚀 Funcionalidades
-1. **Busca Automatizada Diária (5 Plataformas):** Scraping real no **LinkedIn, Gupy, RemoteOK, WeWorkRemotely e Remotive** via `node-cron` e GitHub Actions.
-2. **Filtro de Perfil & Salário:** Avalia o match com o currículo (Mid/Pleno e Sênior) e filtra apenas vagas acima de 12k BRL ou em moeda estrangeira (USD/EUR/GBP).
-3. **WebApp (PWA) para iPhone com Web Push Nativo:** Instalável na Tela de Início do iOS (Safari) com suporte a notificações Push nativas (`web-push` + Service Worker) sempre que novas vagas forem encontradas.
-4. **Deploy Unificado Gratuito:** Um único serviço Node.js serve o Frontend (PWA), a API, o Banco SQLite e o Scraper (pronto para Render ou Railway via `render.yaml` ou `Dockerfile`).
+## ⚙️ Como Executar Localmente (pela raiz `\JobBot`)
 
----
+### Opção 1: Rodar Front + Back simultaneamente (Desenvolvimento)
+Direto na raiz `C:\Workspace\JobBot`, execute **qualquer um** dos comandos abaixo:
 
-## 📲 Como Publicar e Instalar no iPhone
+```powershell
+npm run dev
+```
+ou no Windows PowerShell / CMD:
+```powershell
+.\start.ps1
+# ou
+.\start.bat
+```
+- O script verifica/instala dependências automaticamente se necessário e sobe:
+  - **Backend API & Scraper:** `http://localhost:3000`
+  - **Frontend Dashboard (Vite):** `http://localhost:5173`
 
-### 1. Publicar no Render ou Railway (Serviço Único)
-1. Suba este repositório no seu **GitHub**.
-2. Crie um novo **Web Service** no [Render](https://render.com) ou [Railway](https://railway.app) conectado ao repositório:
-   - **Build Command:** `npm run build`
-   - **Start Command:** `npm start`
-   *(No Render, o arquivo `render.yaml` na raiz já configura tudo automaticamente via Blueprint).*
-
-### 2. Ativar o Agendamento Diário no GitHub Actions
-Para garantir que o servidor gratuito acorde todos os dias às **08:00 (Brasília)**, rode o scraper e envie a notificação pro seu iPhone:
-1. No repositório do GitHub, vá em **Settings → Secrets and variables → Actions**.
-2. Crie uma *Repository Secret* chamada `APP_URL` com a URL pública do seu app (ex: `https://jobbot-gian.onrender.com`).
-3. O workflow `.github/workflows/daily-scrape.yml` rodará diariamente às 08h00 (e também pode ser disparado manualmente na aba **Actions**).
-
-### 3. Instalar o WebApp e Ativar Notificações no iPhone (iOS 16.4+)
-1. Abra a URL publicada (`https://...`) no **Safari** do seu iPhone.
-2. Toque no botão **Compartilhar** (ícone de quadrado com seta para cima na barra inferior).
-3. Role para baixo e toque em **"Adicionar à Tela de Início"** (*Add to Home Screen*) e confirme em **Adicionar**.
-4. Abra o **JobBot** pelo ícone criado na tela inicial do iPhone.
-5. No topo do app, toque em **"Ativar Notificações"**, permita os alertas do iOS e depois toque em **"Push Ativo (Testar)"** para receber uma notificação de teste imediata!
-
----
-
-## ⚙️ Como Executar Localmente
-
-### Modo Unificado (Produção Local)
-```bash
+### Opção 2: Modo Unificado de Produção (Porta única)
+```powershell
 npm run build
 npm start
 ```
-*(Acesse `http://localhost:3000`)*
+- Acesse tudo em `http://localhost:3000`.
 
-### Modo Desenvolvimento
+---
+
+## ☁️ Instruções de Deploy 100% Gratuito (Render + GitHub Actions)
+
+### Passo 1: Subir o código no GitHub
+Na raiz `C:\Workspace\JobBot`, envie o projeto para um repositório no seu GitHub:
 ```bash
-npm run dev:backend
-npm run dev:frontend
+git init
+git add .
+git commit -m "feat: JobBot fullstack otimizado"
+git branch -M main
+git remote add origin https://github.com/SEU_USUARIO/jobbot.git
+git push -u origin main
 ```
-*(O dashboard abrirá em `http://localhost:5173`)*
+
+### Passo 2: Hospedar Gratuitamente no Render.com
+O projeto já possui o arquivo `render.yaml` e `Dockerfile` configurados para rodar **Frontend (PWA) + Backend (API + SQLite + Scraper)** em **um único Web Service gratuito**:
+
+1. Crie uma conta gratuita em [render.com](https://render.com) usando seu login do GitHub.
+2. No painel do Render, clique em **New +** → **Blueprint** (ou **Web Service**).
+   - **Usando Blueprint (Automático):** Selecione o repositório `jobbot`. O Render lerá o arquivo `render.yaml` e configurará tudo sozinho no plano `Free`.
+   - **Usando Web Service Manual:**
+     - **Runtime:** `Node`
+     - **Build Command:** `npm run build`
+     - **Start Command:** `npm start`
+     - **Instance Type:** `Free`
+3. Aguarde o término do build (~2 minutos) e copie a URL pública gerada (ex: `https://jobbot-gian.onrender.com`).
+
+> **Dica (Persistência das chaves VAPID no plano Free):**
+> Para evitar que as chaves de Web Push mudem quando o container gratuito reiniciar, rode `npm run generate-vapid` localmente e adicione `VAPID_PUBLIC_KEY` e `VAPID_PRIVATE_KEY` na aba **Environment** do Render.
+
+### Passo 3: Acordar o Servidor Diariamente via GitHub Actions (Grátis)
+No plano gratuito do Render, o servidor hiberna após 15 minutos sem acesso. O workflow `.github/workflows/daily-scrape.yml` já está pronto para acordar o servidor todos os dias às **08:00 (horário de Brasília)**, rodar o scraper e disparar o Push para o seu iPhone:
+
+1. No seu repositório do GitHub, acesse **Settings** → **Secrets and variables** → **Actions**.
+2. Clique em **New repository secret**:
+   - **Name:** `APP_URL`
+   - **Secret:** `https://jobbot-gian.onrender.com` *(sua URL do Render sem barra no final)*
+3. Pronto! Você também pode testar imediatamente indo na aba **Actions** → **Daily JobBot Scrape & iPhone Push** → **Run workflow**.
+
+### Passo 4: Instalar o WebApp e Ativar Push no iPhone (iOS 16.4+)
+1. Abra a URL do Render (`https://...`) no **Safari** do iPhone.
+2. Toque em **Compartilhar** (ícone na barra inferior) → **Adicionar à Tela de Início** → **Adicionar**.
+3. Abra o aplicativo **JobBot** pelo ícone criado na tela inicial.
+4. Toque no botão **"Ativar Notificações"**, permita os alertas do iOS e depois toque em **"Push Ativo (Testar)"** para receber uma notificação de teste na hora.

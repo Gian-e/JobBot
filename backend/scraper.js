@@ -1,6 +1,6 @@
 /**
  * JobBot Scraper Engine (Node.js)
- * Coleta vagas 100% reais nas plataformas LinkedIn, Gupy, RemoteOK, WeWorkRemotely e Remotive,
+ * Coleta vagas reais nas plataformas LinkedIn, Gupy, RemoteOK, WeWorkRemotely e Remotive,
  * filtra pelo perfil do Gian (Mid/Pleno e Senior, Remote, >= R$ 12k ou USD/EUR/GBP),
  * calcula o match_score (0 a 100) e deduplica por URL seguindo o contrato do SQLite.
  */
@@ -13,40 +13,61 @@ const EXCHANGE_RATES = {
 };
 
 const VALID_CURRENCIES = ['USD', 'EUR', 'BRL', 'GBP'];
+const FOREIGN_CURRENCIES = new Set(['USD', 'EUR', 'GBP']);
 
 const PROFILE_CONFIG = {
     minSalaryBrl: 12000,
     remoteKeywords: ['remote', 'remoto', 'home office', 'anywhere', 'worldwide', 'latam', 'work from home', 'distributed'],
     coreTechKeywords: [
-        { term: 'react', weight: 6 },
-        { term: 'node.js', weight: 6 },
-        { term: 'nodejs', weight: 6 },
-        { term: 'node', weight: 5 },
-        { term: 'python', weight: 6 },
-        { term: 'typescript', weight: 5 },
-        { term: 'fullstack', weight: 6 },
-        { term: 'full stack', weight: 6 },
-        { term: 'full-stack', weight: 6 },
-        { term: 'api rest', weight: 4 },
-        { term: 'rest api', weight: 4 },
-        { term: 'postgresql', weight: 4 },
-        { term: 'postgres', weight: 4 },
-        { term: 'sqlite', weight: 4 },
-        { term: 'sql', weight: 3 },
-        { term: 'javascript', weight: 3 },
-        { term: 'express', weight: 3 },
-        { term: 'fastapi', weight: 4 },
-        { term: 'next.js', weight: 4 },
-        { term: 'nextjs', weight: 4 }
+        { term: 'react', weight: 6, family: 'react' },
+        { term: 'node.js', weight: 6, family: 'node' },
+        { term: 'nodejs', weight: 6, family: 'node' },
+        { term: 'node', weight: 5, family: 'node' },
+        { term: 'python', weight: 6, family: 'python' },
+        { term: 'typescript', weight: 5, family: 'typescript' },
+        { term: 'fullstack', weight: 6, family: 'fullstack' },
+        { term: 'full stack', weight: 6, family: 'fullstack' },
+        { term: 'full-stack', weight: 6, family: 'fullstack' },
+        { term: 'api rest', weight: 4, family: 'rest' },
+        { term: 'rest api', weight: 4, family: 'rest' },
+        { term: 'postgresql', weight: 4, family: 'postgres' },
+        { term: 'postgres', weight: 4, family: 'postgres' },
+        { term: 'sqlite', weight: 4, family: 'sqlite' },
+        { term: 'sql', weight: 3, family: 'sql' },
+        { term: 'javascript', weight: 3, family: 'javascript' },
+        { term: 'express', weight: 3, family: 'express' },
+        { term: 'fastapi', weight: 4, family: 'fastapi' },
+        { term: 'next.js', weight: 4, family: 'next' },
+        { term: 'nextjs', weight: 4, family: 'next' }
     ],
-    seniorityKeywords: [
-        'senior', 'sênior', 'sr', 'lead', 'pleno', 'mid', 'mid-level', 'staff'
-    ],
+    seniorityKeywords: ['senior', 'sênior', 'sr', 'lead', 'pleno', 'mid', 'mid-level', 'staff'],
     nonTargetTitleTerms: [
         'ruby', 'rails', 'php', 'laravel', 'ios', 'swift', 'android',
         'kotlin', 'c++', 'rust', 'golang', 'vue', 'angular', '.net', 'c#', 'java '
-    ]
+    ],
+    coreTitleTerms: ['react', 'node', 'python', 'typescript'],
+    coreMatchTerms: [
+        'react', 'node', 'python', 'typescript', 'fullstack', 'full stack',
+        'full-stack', 'javascript', 'backend', 'back-end', 'software engineer', 'desenvolvedor'
+    ],
+    coreCorpusTerms: ['react', 'node.js', 'nodejs', 'python', 'typescript', 'fullstack', 'full-stack']
 };
+
+const HTML_ENTITIES = {
+    '&amp;': '&',
+    '&lt;': '<',
+    '&gt;': '>',
+    '&quot;': '"',
+    '&#39;': "'"
+};
+
+const INTERN_REGEX = /\b(intern|internship|est[aá]gio|estagi[aá]rio|trainee)\b/i;
+const JUNIOR_OR_INTERN_REGEX = /\b(est[aá]gio|estagi[aá]rio|trainee|j[uú]nior|jr)\b/i;
+const SENIOR_REGEX = /\b(s[eê]nior|sr|lead|especialista|staff)\b/i;
+
+function getTodayIso() {
+    return new Date().toISOString().slice(0, 10);
+}
 
 /**
  * Remove tags HTML e decodifica entidades básicas
@@ -54,11 +75,7 @@ const PROFILE_CONFIG = {
 function stripHtml(raw = '') {
     return String(raw || '')
         .replace(/<[^>]+>/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
+        .replace(/&(?:amp|lt|gt|quot|#39);/g, (m) => HTML_ENTITIES[m] || m)
         .replace(/\s+/g, ' ')
         .trim();
 }
@@ -88,7 +105,7 @@ export function parseWorkHours(rawJob = {}) {
         return String(rawJob.work_hours).trim();
     }
 
-    const corpus = `${rawJob.title || ''} ${rawJob.description || ''} ${(rawJob.tags || []).join(' ')}`.toLowerCase();
+    const corpus = `${rawJob.title || ''} ${rawJob.description || ''} ${(rawJob.tags || []).join(' ')}`;
 
     if (/part[\s-]?time|meio[\s-]?per[ií]odo|4h|20h\/sem|20\s*hours/i.test(corpus)) {
         return '4h/dia (Meio Período)';
@@ -126,7 +143,7 @@ export function parseSalaryInfo(salaryText = '', defaultCurrency = 'USD', fallba
     }
 
     const matches = text.match(/\d[\d.,]*/g);
-    if (!matches || matches.length === 0) {
+    if (!matches) {
         return {
             salary: text,
             currency,
@@ -151,12 +168,14 @@ export function parseSalaryInfo(salaryText = '', defaultCurrency = 'USD', fallba
         };
     }
 
-    let avgValue = parsedNumbers.slice(0, 2).reduce((acc, v) => acc + v, 0) / Math.min(parsedNumbers.length, 2);
+    const count = Math.min(parsedNumbers.length, 2);
+    let avgValue = (parsedNumbers[0] + (count === 2 ? parsedNumbers[1] : 0)) / count;
+
     if (/k\b/i.test(text) && avgValue < 500) {
         avgValue *= 1000;
     }
     if (currency !== 'BRL' && avgValue > 35000) {
-        avgValue /= 12; // Converte valor anual em mensal
+        avgValue /= 12;
     }
 
     return {
@@ -168,7 +187,7 @@ export function parseSalaryInfo(salaryText = '', defaultCurrency = 'USD', fallba
 
 /**
  * Calcula o match_score (0 a 100) baseando-se no cruzamento de palavras-chave
- * do título, tags, descrição, senioridade e bônus de moeda estrangeira (+5 a +10 pontos).
+ * do título, tags, descrição, senioridade e bônus de moeda estrangeira.
  */
 export function calculateMatchScore(job) {
     const titleLower = String(job.title || '').toLowerCase();
@@ -177,50 +196,36 @@ export function calculateMatchScore(job) {
     const combined = `${titleLower} ${tagsLower} ${descLower}`;
 
     let score = 55;
-
-    // 1. Pontuação por Tech Stack (até 29 pontos)
     let techPoints = 0;
     const matchedFamilies = new Set();
 
-    for (const { term, weight } of PROFILE_CONFIG.coreTechKeywords) {
-        if (combined.includes(term)) {
-            const family = term.includes('node') ? 'node'
-                : term.includes('full') ? 'fullstack'
-                : term.includes('postgres') ? 'postgres'
-                : term.includes('rest') ? 'rest'
-                : term.includes('next') ? 'next'
-                : term;
-
-            if (!matchedFamilies.has(family)) {
-                matchedFamilies.add(family);
-                if (titleLower.includes(term) || tagsLower.includes(term)) {
-                    techPoints += weight + 1;
-                } else {
-                    techPoints += Math.max(2, Math.floor(weight / 2));
-                }
-            }
+    for (const { term, weight, family } of PROFILE_CONFIG.coreTechKeywords) {
+        if (!matchedFamilies.has(family) && combined.includes(term)) {
+            matchedFamilies.add(family);
+            techPoints += (titleLower.includes(term) || tagsLower.includes(term))
+                ? weight + 1
+                : Math.max(2, Math.floor(weight / 2));
         }
     }
     score += Math.min(techPoints, 29);
 
-    // 2. Pontuação por Senioridade (Pleno / Mid / Senior / Lead) (até 6 pontos)
     if (PROFILE_CONFIG.seniorityKeywords.some((s) => titleLower.includes(s))) {
         score += 6;
     } else if (PROFILE_CONFIG.seniorityKeywords.some((s) => descLower.includes(s))) {
         score += 3;
     }
 
-    // 3. Bônus para moedas estrangeiras USD / EUR / GBP (+5 a +10 pontos conforme especificação)
     const currency = String(job.currency || 'BRL').toUpperCase();
     const salaryBrl = Number(job.salary_brl || 0);
 
-    if (['USD', 'EUR', 'GBP'].includes(currency)) {
+    if (FOREIGN_CURRENCIES.has(currency)) {
         if (salaryBrl >= 25000) score += 9;
         else if (salaryBrl >= 18000) score += 7;
         else score += 5;
-    } else {
-        if (salaryBrl >= 15000) score += 4;
-        else if (salaryBrl >= 12000) score += 2;
+    } else if (salaryBrl >= 15000) {
+        score += 4;
+    } else if (salaryBrl >= 12000) {
+        score += 2;
     }
 
     return Math.max(0, Math.min(100, Math.round(score)));
@@ -230,44 +235,42 @@ export function calculateMatchScore(job) {
  * Valida se a vaga atende aos requisitos do perfil do Gian:
  * 1. Modalidade estritamente Remote / Home Office
  * 2. Remuneração mínima: salary_brl >= 12000 ou moeda estrangeira (USD, EUR, GBP)
- * 3. Tech Stack compatível (React, Node.js, Python, TypeScript, Fullstack, API REST, PostgreSQL/SQLite)
+ * 3. Tech Stack compatível
  */
 export function matchesProfileFilter(job) {
-    const locationAndTitle = `${job.location || ''} ${job.title || ''} ${job.description || ''}`.toLowerCase();
-    const isRemote = PROFILE_CONFIG.remoteKeywords.some((kw) => locationAndTitle.includes(kw));
-    if (!isRemote) return false;
-
     const titleLower = String(job.title || '').toLowerCase();
-    if (/\b(intern|internship|est[aá]gio|estagi[aá]rio|trainee)\b/i.test(titleLower)) {
+    if (INTERN_REGEX.test(titleLower)) return false;
+
+    const descLower = String(job.description || '').toLowerCase();
+    const locationLower = String(job.location || '').toLowerCase();
+    const locationAndTitle = `${locationLower} ${titleLower} ${descLower}`;
+
+    if (!PROFILE_CONFIG.remoteKeywords.some((kw) => locationAndTitle.includes(kw))) {
         return false;
     }
 
-    // Exclui vagas cujo título seja explicitamente de outra stack sem citar React/Node/Python/TS
     const hasNonTargetTitle = PROFILE_CONFIG.nonTargetTitleTerms.some((t) => titleLower.includes(t));
-    const hasCoreInTitle = ['react', 'node', 'python', 'typescript'].some((t) => titleLower.includes(t));
-    if (hasNonTargetTitle && !hasCoreInTitle) {
+    if (hasNonTargetTitle && !PROFILE_CONFIG.coreTitleTerms.some((t) => titleLower.includes(t))) {
         return false;
     }
 
-    const isForeignCurrency = ['USD', 'EUR', 'GBP'].includes(job.currency);
-    const hasValidSalary = Number(job.salary_brl) >= PROFILE_CONFIG.minSalaryBrl || isForeignCurrency;
+    const hasValidSalary = Number(job.salary_brl) >= PROFILE_CONFIG.minSalaryBrl || FOREIGN_CURRENCIES.has(job.currency);
     if (!hasValidSalary) return false;
 
     const titleAndTags = `${titleLower} ${(job.tags || []).join(' ').toLowerCase()}`;
-    const coreMatchTerms = ['react', 'node', 'python', 'typescript', 'fullstack', 'full stack', 'full-stack', 'javascript', 'backend', 'back-end', 'software engineer', 'desenvolvedor'];
-    if (coreMatchTerms.some((term) => titleAndTags.includes(term))) {
+    if (PROFILE_CONFIG.coreMatchTerms.some((term) => titleAndTags.includes(term))) {
         return true;
     }
 
-    const fullCorpus = `${titleAndTags} ${String(job.description || '').toLowerCase()}`;
-    return ['react', 'node.js', 'nodejs', 'python', 'typescript', 'fullstack', 'full-stack'].some((term) => fullCorpus.includes(term));
+    const fullCorpus = `${titleAndTags} ${descLower}`;
+    return PROFILE_CONFIG.coreCorpusTerms.some((term) => fullCorpus.includes(term));
 }
 
 /**
- * Normaliza qualquer objeto bruto de vaga para seguir estritamente o Contrato de Recebimento de Dados
+ * Normaliza qualquer objeto bruto de vaga para seguir o Contrato de Recebimento de Dados
  */
 export function normalizeJobContract(rawJob) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayIso();
     const salaryData = rawJob.salary_brl
         ? {
             salary: rawJob.salary || 'A combinar',
@@ -277,15 +280,12 @@ export function normalizeJobContract(rawJob) {
         : parseSalaryInfo(rawJob.salary, rawJob.currency || 'USD', rawJob.estimated_monthly || 4000);
 
     const workHours = parseWorkHours(rawJob);
-
-    const enriched = {
+    const matchScore = calculateMatchScore({
         ...rawJob,
         currency: salaryData.currency,
         salary_brl: salaryData.salary_brl,
         work_hours: workHours
-    };
-
-    const matchScore = calculateMatchScore(enriched);
+    });
 
     const formattedDate = rawJob.date && /^\d{4}-\d{2}-\d{2}/.test(rawJob.date)
         ? rawJob.date.slice(0, 10)
@@ -320,11 +320,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
 }
 
 /**
- * 1. LinkedIn Jobs (Guest Search API pública com f_WT=2 Remote)
+ * 1. LinkedIn Jobs (Guest Search API pública com f_WT=2 Remote - paralelo)
  */
 async function fetchLinkedInJobs() {
-    const today = new Date().toISOString().split('T')[0];
-    const results = [];
+    const today = getTodayIso();
     const queries = [
         { keywords: 'Full Stack React Node', location: 'Worldwide', currency: 'USD', fallback: 4500 },
         { keywords: 'Python React Developer', location: 'Latin America', currency: 'USD', fallback: 4200 },
@@ -332,111 +331,118 @@ async function fetchLinkedInJobs() {
         { keywords: 'Desenvolvedor Python Pleno Senior', location: 'Brazil', currency: 'BRL', fallback: 14500 }
     ];
 
-    for (const q of queries) {
-        try {
-            const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(q.keywords)}&location=${encodeURIComponent(q.location)}&f_WT=2&start=0`;
-            const resp = await fetchWithTimeout(url, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-                }
-            });
-            if (!resp.ok) continue;
-
-            const htmlText = await resp.text();
-            const cards = htmlText.match(/<li[\s\S]*?<\/li>/gi) || [];
-
-            for (const card of cards.slice(0, 12)) {
-                const titleMatch = card.match(/base-search-card__title[^>]*>([\s\S]*?)<\/h3>/i);
-                const compMatch = card.match(/base-search-card__subtitle[^>]*>([\s\S]*?)<\/h4>/i);
-                const locMatch = card.match(/job-search-card__location[^>]*>([\s\S]*?)<\/span>/i);
-                const salMatch = card.match(/job-search-card__salary-info[^>]*>([\s\S]*?)<\/span>/i);
-                const linkMatch = card.match(/href="(https:\/\/[^"]*linkedin\.com\/jobs\/view\/[^"?]+)/i);
-                const dateMatch = card.match(/<time[^>]*datetime="(\d{4}-\d{2}-\d{2})"/i);
-
-                if (!titleMatch || !linkMatch) continue;
-
-                const title = stripHtml(titleMatch[1]);
-                const company = compMatch ? stripHtml(compMatch[1]) : 'LinkedIn Recruiting';
-                const rawLoc = locMatch ? stripHtml(locMatch[1]) : q.location;
-                const location = /remote|remoto/i.test(rawLoc) ? rawLoc : `Remote (${rawLoc})`;
-                const rawSal = salMatch ? stripHtml(salMatch[1]) : '';
-                const salaryInfo = parseSalaryInfo(rawSal, q.currency, q.fallback);
-
-                results.push({
-                    title,
-                    company,
-                    location,
-                    salary: salaryInfo.salary,
-                    currency: salaryInfo.currency,
-                    salary_brl: salaryInfo.salary_brl,
-                    platform: 'LinkedIn',
-                    url: normalizeUrl(linkMatch[1]),
-                    date: dateMatch ? dateMatch[1] : today,
-                    tags: q.keywords.split(' '),
-                    description: `${title} - ${company} (${location}) - ${q.keywords}`
+    const batches = await Promise.all(
+        queries.map(async (q) => {
+            try {
+                const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(q.keywords)}&location=${encodeURIComponent(q.location)}&f_WT=2&start=0`;
+                const resp = await fetchWithTimeout(url, {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                    }
                 });
+                if (!resp.ok) return [];
+
+                const htmlText = await resp.text();
+                const cards = htmlText.match(/<li[\s\S]*?<\/li>/gi) || [];
+                const parsed = [];
+
+                for (const card of cards.slice(0, 12)) {
+                    const titleMatch = card.match(/base-search-card__title[^>]*>([\s\S]*?)<\/h3>/i);
+                    const linkMatch = card.match(/href="(https:\/\/[^"]*linkedin\.com\/jobs\/view\/[^"?]+)/i);
+                    if (!titleMatch || !linkMatch) continue;
+
+                    const compMatch = card.match(/base-search-card__subtitle[^>]*>([\s\S]*?)<\/h4>/i);
+                    const locMatch = card.match(/job-search-card__location[^>]*>([\s\S]*?)<\/span>/i);
+                    const salMatch = card.match(/job-search-card__salary-info[^>]*>([\s\S]*?)<\/span>/i);
+                    const dateMatch = card.match(/<time[^>]*datetime="(\d{4}-\d{2}-\d{2})"/i);
+
+                    const title = stripHtml(titleMatch[1]);
+                    const company = compMatch ? stripHtml(compMatch[1]) : 'LinkedIn Recruiting';
+                    const rawLoc = locMatch ? stripHtml(locMatch[1]) : q.location;
+                    const location = /remote|remoto/i.test(rawLoc) ? rawLoc : `Remote (${rawLoc})`;
+                    const salaryInfo = parseSalaryInfo(salMatch ? stripHtml(salMatch[1]) : '', q.currency, q.fallback);
+
+                    parsed.push({
+                        title,
+                        company,
+                        location,
+                        salary: salaryInfo.salary,
+                        currency: salaryInfo.currency,
+                        salary_brl: salaryInfo.salary_brl,
+                        platform: 'LinkedIn',
+                        url: normalizeUrl(linkMatch[1]),
+                        date: dateMatch ? dateMatch[1] : today,
+                        tags: q.keywords.split(' '),
+                        description: `${title} - ${company} (${location}) - ${q.keywords}`
+                    });
+                }
+                return parsed;
+            } catch (err) {
+                console.warn(`[Scraper] Aviso LinkedIn (${q.keywords}):`, err.message);
+                return [];
             }
-        } catch (err) {
-            console.warn(`[Scraper] Aviso LinkedIn (${q.keywords}):`, err.message);
-        }
-    }
-    return results;
+        })
+    );
+
+    return batches.flat();
 }
 
 /**
- * 2. Gupy Portal API (Vagas remotas no Brasil)
+ * 2. Gupy Portal API (Vagas remotas no Brasil - paralelo)
  */
 async function fetchGupyJobs() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayIso();
     const terms = ['Node.js', 'React', 'Python', 'Fullstack'];
-    const results = [];
 
-    for (const term of terms) {
-        try {
-            const url = `https://portal.api.gupy.io/api/v1/jobs?jobName=${encodeURIComponent(term)}&workplaceType=remote&limit=10`;
-            const response = await fetchWithTimeout(url, {
-                headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
-            });
-            if (!response.ok) continue;
-
-            const json = await response.json();
-            const items = Array.isArray(json.data) ? json.data : [];
-
-            for (const item of items) {
-                const title = String(item.name || '').trim();
-                const jobUrl = normalizeUrl(item.jobUrl || '');
-                if (!title || !jobUrl) continue;
-                if (/\b(est[aá]gio|estagi[aá]rio|trainee|j[uú]nior|jr)\b/i.test(title)) continue;
-
-                const isSenior = /\b(s[eê]nior|sr|lead|especialista|staff)\b/i.test(title);
-                const estimatedBrl = isSenior ? 15500 : 12800;
-
-                results.push({
-                    title,
-                    company: item.careerPageName || 'Empresa Gupy',
-                    location: 'Home Office (Brasil)',
-                    salary: `R$ ${estimatedBrl.toLocaleString('pt-BR')}/mês (Est.)`,
-                    currency: 'BRL',
-                    salary_brl: estimatedBrl,
-                    platform: 'Gupy',
-                    url: jobUrl,
-                    date: item.publishedDate ? String(item.publishedDate).slice(0, 10) : today,
-                    tags: [term, 'Remote', 'Brasil'],
-                    description: stripHtml(item.description || '')
+    const batches = await Promise.all(
+        terms.map(async (term) => {
+            try {
+                const url = `https://portal.api.gupy.io/api/v1/jobs?jobName=${encodeURIComponent(term)}&workplaceType=remote&limit=10`;
+                const response = await fetchWithTimeout(url, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
                 });
+                if (!response.ok) return [];
+
+                const json = await response.json();
+                const items = Array.isArray(json.data) ? json.data : [];
+                const parsed = [];
+
+                for (const item of items) {
+                    const title = String(item.name || '').trim();
+                    const jobUrl = normalizeUrl(item.jobUrl || '');
+                    if (!title || !jobUrl || JUNIOR_OR_INTERN_REGEX.test(title)) continue;
+
+                    const estimatedBrl = SENIOR_REGEX.test(title) ? 15500 : 12800;
+
+                    parsed.push({
+                        title,
+                        company: item.careerPageName || 'Empresa Gupy',
+                        location: 'Home Office (Brasil)',
+                        salary: `R$ ${estimatedBrl.toLocaleString('pt-BR')}/mês (Est.)`,
+                        currency: 'BRL',
+                        salary_brl: estimatedBrl,
+                        platform: 'Gupy',
+                        url: jobUrl,
+                        date: item.publishedDate ? String(item.publishedDate).slice(0, 10) : today,
+                        tags: [term, 'Remote', 'Brasil'],
+                        description: stripHtml(item.description || '')
+                    });
+                }
+                return parsed;
+            } catch {
+                return [];
             }
-        } catch {
-            // Ignora falha individual
-        }
-    }
-    return results;
+        })
+    );
+
+    return batches.flat();
 }
 
 /**
  * 3. RemoteOK API (Vagas internacionais em USD)
  */
 async function fetchRemoteOkJobs() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayIso();
     try {
         const response = await fetchWithTimeout('https://remoteok.com/api', {
             headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
@@ -485,68 +491,73 @@ async function fetchRemoteOkJobs() {
 }
 
 /**
- * 4. WeWorkRemotely RSS (Full-Stack & Backend Programming)
+ * 4. WeWorkRemotely RSS (Full-Stack & Backend Programming - paralelo)
  */
 async function fetchWeWorkRemotelyJobs() {
-    const today = new Date().toISOString().split('T')[0];
-    const results = [];
+    const today = getTodayIso();
     const rssUrls = [
         'https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss',
         'https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss'
     ];
 
-    for (const rssUrl of rssUrls) {
-        try {
-            const response = await fetchWithTimeout(rssUrl, {
-                headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
-            });
-            if (!response.ok) continue;
-
-            const xmlText = await response.text();
-            const items = xmlText.match(/<item>[\s\S]*?<\/item>/gi) || [];
-
-            for (const itemXml of items.slice(0, 15)) {
-                const rawTitle = stripHtml((itemXml.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || '');
-                const region = stripHtml((itemXml.match(/<region>([\s\S]*?)<\/region>/i) || [])[1] || 'Worldwide');
-                const link = stripHtml((itemXml.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || '');
-                const description = stripHtml((itemXml.match(/<description>([\s\S]*?)<\/description>/i) || [])[1] || '');
-
-                if (!rawTitle || !link) continue;
-
-                const parts = rawTitle.split(':');
-                const company = parts.length > 1 ? parts[0].trim() : 'WWR Partner';
-                const title = parts.length > 1 ? parts.slice(1).join(':').trim() : rawTitle;
-
-                const workHours = parseWorkHours({ title, description });
-                const monthlyUsd = workHours.includes('4h') ? 2800 : 4800;
-
-                results.push({
-                    title,
-                    company,
-                    location: `Remote (${region})`,
-                    salary: `$${monthlyUsd.toLocaleString('en-US')} / month (Est.)`,
-                    currency: 'USD',
-                    salary_brl: convertToBrl(monthlyUsd, 'USD'),
-                    platform: 'WeWorkRemotely',
-                    url: normalizeUrl(link),
-                    date: today,
-                    work_hours: workHours,
-                    tags: [],
-                    description: description.slice(0, 600)
+    const batches = await Promise.all(
+        rssUrls.map(async (rssUrl) => {
+            try {
+                const response = await fetchWithTimeout(rssUrl, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
                 });
+                if (!response.ok) return [];
+
+                const xmlText = await response.text();
+                const items = xmlText.match(/<item>[\s\S]*?<\/item>/gi) || [];
+                const parsed = [];
+
+                for (const itemXml of items.slice(0, 15)) {
+                    const rawTitle = stripHtml((itemXml.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || '');
+                    const link = stripHtml((itemXml.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || '');
+                    if (!rawTitle || !link) continue;
+
+                    const region = stripHtml((itemXml.match(/<region>([\s\S]*?)<\/region>/i) || [])[1] || 'Worldwide');
+                    const description = stripHtml((itemXml.match(/<description>([\s\S]*?)<\/description>/i) || [])[1] || '');
+
+                    const parts = rawTitle.split(':');
+                    const company = parts.length > 1 ? parts[0].trim() : 'WWR Partner';
+                    const title = parts.length > 1 ? parts.slice(1).join(':').trim() : rawTitle;
+
+                    const workHours = parseWorkHours({ title, description });
+                    const monthlyUsd = workHours.includes('4h') ? 2800 : 4800;
+
+                    parsed.push({
+                        title,
+                        company,
+                        location: `Remote (${region})`,
+                        salary: `$${monthlyUsd.toLocaleString('en-US')} / month (Est.)`,
+                        currency: 'USD',
+                        salary_brl: convertToBrl(monthlyUsd, 'USD'),
+                        platform: 'WeWorkRemotely',
+                        url: normalizeUrl(link),
+                        date: today,
+                        work_hours: workHours,
+                        tags: [],
+                        description: description.slice(0, 600)
+                    });
+                }
+                return parsed;
+            } catch (err) {
+                console.warn('[Scraper] Aviso WeWorkRemotely:', err.message);
+                return [];
             }
-        } catch (err) {
-            console.warn('[Scraper] Aviso WeWorkRemotely:', err.message);
-        }
-    }
-    return results;
+        })
+    );
+
+    return batches.flat();
 }
 
 /**
  * 5. Remotive API (Software Development Remote Jobs)
  */
 async function fetchRemotiveJobs() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayIso();
     try {
         const response = await fetchWithTimeout('https://remotive.com/api/remote-jobs?category=software-dev&limit=25', {
             headers: { 'User-Agent': 'Mozilla/5.0 JobBot-Scraper/1.0' }
@@ -583,13 +594,13 @@ async function fetchRemotiveJobs() {
 }
 
 /**
- * Executa a varredura 100% real em todas as fontes, filtra pelo perfil do Gian,
+ * Executa a varredura real em todas as fontes em paralelo, filtra pelo perfil do Gian,
  * calcula o match_score (0 a 100) e deduplica por URL.
  */
 export async function scrapeJobs() {
     console.log('[Scraper] Iniciando varredura real (LinkedIn, Gupy, RemoteOK, WeWorkRemotely, Remotive)...');
 
-    const [linkedInJobs, gupyJobs, remoteOkJobs, wwrJobs, remotiveJobs] = await Promise.all([
+    const batches = await Promise.all([
         fetchLinkedInJobs(),
         fetchGupyJobs(),
         fetchRemoteOkJobs(),
@@ -597,41 +608,20 @@ export async function scrapeJobs() {
         fetchRemotiveJobs()
     ]);
 
-    const rawCandidates = [
-        ...linkedInJobs,
-        ...gupyJobs,
-        ...remoteOkJobs,
-        ...wwrJobs,
-        ...remotiveJobs
-    ];
-
+    const rawCandidates = batches.flat();
     const seenUrls = new Set();
     const validJobs = [];
 
     for (const candidate of rawCandidates) {
-        if (!candidate || !candidate.url || !candidate.title) continue;
+        if (!candidate?.url || !candidate?.title) continue;
 
         const normalizedUrl = normalizeUrl(candidate.url);
         if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
-
         if (!matchesProfileFilter(candidate)) continue;
 
-        const contractJob = normalizeJobContract(candidate);
-
-        if (
-            contractJob.title &&
-            contractJob.company &&
-            contractJob.location &&
-            VALID_CURRENCIES.includes(contractJob.currency) &&
-            (contractJob.salary_brl >= PROFILE_CONFIG.minSalaryBrl || ['USD', 'EUR', 'GBP'].includes(contractJob.currency)) &&
-            contractJob.platform &&
-            contractJob.url &&
-            contractJob.date &&
-            Number.isInteger(contractJob.match_score)
-        ) {
-            seenUrls.add(normalizedUrl);
-            validJobs.push(contractJob);
-        }
+        const contractJob = normalizeJobContract({ ...candidate, url: normalizedUrl });
+        seenUrls.add(normalizedUrl);
+        validJobs.push(contractJob);
     }
 
     validJobs.sort((a, b) => b.match_score - a.match_score || b.salary_brl - a.salary_brl);

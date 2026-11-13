@@ -2,13 +2,6 @@
 node_modules/
 **/node_modules/
 
-# Python virtual environments & cache
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-env/
-
 # Environment variables
 .env
 .env.local
@@ -16,9 +9,12 @@ env/
 
 # Database & local data
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
-data/*.db
+**/data/*.db
 **/vapid.json
 
 # Builds & logs
