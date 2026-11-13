@@ -1,0 +1,27 @@
+name: Daily JobBot Scrape & iPhone Push
+
+on:
+  schedule:
+    # Executa todos os dias às 08:00 AM (Horário de Brasília / 11:00 UTC)
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger-scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up server & run daily scraper
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "Defina a secret APP_URL no GitHub (ex: https://jobbot-gian.onrender.com)"
+            exit 1
+          fi
+          CLEAN_URL="${APP_URL%/}"
+          echo "Acordando servidor em $CLEAN_URL/api/health ..."
+          curl -sS --retry 5 --retry-delay 10 --max-time 90 "$CLEAN_URL/api/health" || true
+          echo ""
+          echo "Disparando busca diária e Web Push em $CLEAN_URL/api/jobs/scrape ..."
+          curl -sS -X POST --max-time 120 "$CLEAN_URL/api/jobs/scrape"
+          echo ""

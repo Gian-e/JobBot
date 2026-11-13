@@ -1,9 +1,0 @@
-{
-  "name": "jobbot-scraper",
-  "version": "1.0.0",
-  "description": "Python Scraper for JobBot",
-  "main": "scraper.py",
-  "dependencies": {
-    "requests": "^2.31.0"
-  }
-}

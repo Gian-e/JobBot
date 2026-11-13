@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: jobbot-gian
+    runtime: node
+    plan: free
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: VAPID_SUBJECT
+        value: mailto:gian@jobbot.app
