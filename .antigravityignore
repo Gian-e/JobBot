@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Lockfiles
+package-lock.json
+**/package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Builds, caches & heavy assets
+dist/
+build/
+coverage/
+.cache/
+__pycache__/
+.venv/
+venv/
+
+# Databases & logs
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.log
+logs/

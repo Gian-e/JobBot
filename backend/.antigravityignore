@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Lockfiles
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Builds, caches & heavy assets
+dist/
+build/
+coverage/
+.cache/
+
+# Databases & logs
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.log
+logs/
