@@ -331,8 +331,12 @@ function saveJobsToDatabase(jobs = [], { notifyOnNew = true, alwaysNotify = fals
 
 // Lock para evitar execuções concorrentes do worker
 let activeScrapePromise = null;
+let forceNotifyCurrentRun = false;
 
 async function runScraper({ alwaysNotify = false } = {}) {
+    if (alwaysNotify) {
+        forceNotifyCurrentRun = true;
+    }
     if (activeScrapePromise) {
         return activeScrapePromise;
     }
@@ -344,7 +348,10 @@ async function runScraper({ alwaysNotify = false } = {}) {
             const cleanup = await purgeClosedAndExpiredJobs();
             // 2. Coleta e valida novas vagas abertas
             const jobs = await scrapeJobs();
-            const stats = await saveJobsToDatabase(jobs, { notifyOnNew: true, alwaysNotify });
+            const stats = await saveJobsToDatabase(jobs, {
+                notifyOnNew: true,
+                alwaysNotify: forceNotifyCurrentRun
+            });
             return {
                 jobs,
                 newCount: stats.newCount,
@@ -355,6 +362,7 @@ async function runScraper({ alwaysNotify = false } = {}) {
             return { jobs: [], newCount: 0, removedClosedCount: 0 };
         } finally {
             activeScrapePromise = null;
+            forceNotifyCurrentRun = false;
         }
     })();
 
@@ -493,8 +501,6 @@ const server = app.listen(PORT, () => {
     db.get(`SELECT COUNT(*) as count FROM jobs`, [], (err, row) => {
         if (!err && (!row || row.count === 0)) {
             runScraper({ alwaysNotify: false });
-        } else {
-            purgeClosedAndExpiredJobs();
         }
     });
 });
